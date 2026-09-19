@@ -7,12 +7,14 @@
  *   reboot    — перезагрузка (CACT_SYSCTL_REBOOT + CACT_REBOOT_RESTART)
  *   halt      — остановка (CACT_REBOOT_HALT)
  *   poweroff  — выключение (CACT_REBOOT_POWEROFF)
+ *   suspend   — сон в RAM (CACT_REBOOT_SUSPEND; алиас: sleep), отвечает
+ *               "ok\n" только после пробуждения
  *
  * Сокет только в ядерном реестре (файл в /run не создаётся). Кнопочные/ACPI
  * события питанием не передаются в юзерспейс — powerd лишь исполняет запросы
  * и ведёт журнал. Запускается супервизором cgoct как /sbin/powerd.
  *
- * /etc/powerd.conf (все ключи необязательны):
+ * /etc/powerd.conf (все ключи необязательны; создаётся при первом запуске):
  *   file=/var/log/powerd.log
  *   console=0
  */
@@ -29,6 +31,7 @@
 #include <ioctl_abi.h>
 #include <poll.h>
 
+#define CONFIG_PATH "/etc/powerd.conf"
 #define SOCK_PATH   "/run/powerd.sock"
 #define LOG_DEFAULT "/var/log/powerd.log"
 #define LINE_MAX    128
@@ -37,9 +40,34 @@ static char log_path[128] = LOG_DEFAULT;
 static int  console_on    = 0;
 static int  out_fd        = -1;
 
+/* Конфиг по умолчанию: пишется при первом запуске, если файла ещё нет. */
+static const char default_config[] =
+    "# powerd config - auto-generated on first start.\n"
+    "#\n"
+    "# file    - журнал событий\n"
+    "# console - дублировать на /dev/console (0|1)\n"
+    "\n"
+    "file=/var/log/powerd.log\n"
+    "console=0\n";
+
+static void ensure_dir(const char *path) {
+    (void)mkdir(path, 0755);
+}
+
+static void config_write_default(void) {
+    int fd = open(CONFIG_PATH, O_WRONLY | O_CREAT | O_EXCL, 0644);
+    if (fd < 0) return;
+    write(fd, default_config, sizeof(default_config) - 1);
+    close(fd);
+}
+
 static void config_load(void) {
-    FILE *f = fopen("/etc/powerd.conf", "r");
-    if (!f) return;
+    FILE *f = fopen(CONFIG_PATH, "r");
+    if (!f) {
+        config_write_default();
+        f = fopen(CONFIG_PATH, "r");
+        if (!f) return;
+    }
     char line[160];
     while (fgets(line, sizeof(line), f)) {
         char *p = line;
@@ -77,8 +105,10 @@ static void log_event(const char *msg) {
     }
 }
 
-/* Выполнить команду управления питанием (root only, /dev/sys). */
-static void power_cmd(uint32_t cmd, const char *name) {
+/* Выполнить команду управления питанием (root only, /dev/sys).
+ * Возвращает результат ioctl: для reboot/halt/poweroff управление сюда обычно
+ * не возвращается, suspend возвращается после пробуждения. */
+static int power_cmd(uint32_t cmd, const char *name) {
     char line[128];
     snprintf(line, sizeof(line), "powerd: executing %s\n", name);
     log_event(line);
@@ -89,10 +119,11 @@ static void power_cmd(uint32_t cmd, const char *name) {
         snprintf(line, sizeof(line), "powerd: cannot open /dev/sys\n");
         log_event(line);
         printf("%s", line);
-        return;
+        return -1;
     }
-    ioctl(fd, CACT_SYSCTL_REBOOT, &cmd);
-    close(fd); /* сюда обычно не возвращаемся */
+    int r = ioctl(fd, CACT_SYSCTL_REBOOT, &cmd);
+    close(fd);
+    return r;
 }
 
 static void handle_client(int cl) {
@@ -122,11 +153,22 @@ static void handle_client(int cl) {
         send(cl, "ok running\n", 11, 0);
         log_event("powerd: status requested\n");
     } else if (strcmp(req, "reboot") == 0) {
-        power_cmd(CACT_REBOOT_RESTART, "reboot");
+        if (power_cmd(CACT_REBOOT_RESTART, "reboot") != 0)
+            send(cl, "ERR reboot rejected\n", 20, 0);
     } else if (strcmp(req, "halt") == 0) {
-        power_cmd(CACT_REBOOT_HALT, "halt");
+        if (power_cmd(CACT_REBOOT_HALT, "halt") != 0)
+            send(cl, "ERR halt rejected\n", 18, 0);
     } else if (strcmp(req, "poweroff") == 0) {
-        power_cmd(CACT_REBOOT_POWEROFF, "poweroff");
+        if (power_cmd(CACT_REBOOT_POWEROFF, "poweroff") != 0)
+            send(cl, "ERR poweroff rejected\n", 22, 0);
+    } else if (strcmp(req, "suspend") == 0 || strcmp(req, "sleep") == 0) {
+        /* Блокируется до пробуждения платформы. */
+        if (power_cmd(CACT_REBOOT_SUSPEND, "suspend") == 0) {
+            send(cl, "ok\n", 3, 0);
+            log_event("powerd: resumed\n");
+        } else {
+            send(cl, "ERR suspend rejected\n", 21, 0);
+        }
     } else {
         const char *err = "ERR unknown command\n";
         send(cl, err, (uint32_t)strlen(err), 0);
@@ -162,6 +204,8 @@ int main(int argc, char *argv[]) {
 
     printf("powerd: starting\n");
     config_load();
+    ensure_dir("/var/log");
+    ensure_dir("/run");
 
     out_fd = open(log_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (out_fd < 0) {
