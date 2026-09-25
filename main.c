@@ -1,20 +1,20 @@
 /*
- * powerd — демон управления питанием CactOS (упрощённый аналог systemd-logind
- * в части power).
+ * powerd — power management daemon for CactOS (simplified analog of
+ * systemd-logind for the power part).
  *
- * Слушает AF_UNIX-сокет /run/powerd.sock и исполняет команды:
- *   status    — отвечает "ok running\n"
- *   reboot    — перезагрузка (CACT_SYSCTL_REBOOT + CACT_REBOOT_RESTART)
- *   halt      — остановка (CACT_REBOOT_HALT)
- *   poweroff  — выключение (CACT_REBOOT_POWEROFF)
- *   suspend   — сон в RAM (CACT_REBOOT_SUSPEND; алиас: sleep), отвечает
- *               "ok\n" только после пробуждения
+ * Listens on the AF_UNIX socket /run/powerd.sock and executes commands:
+ *   status    — replies "ok running\n"
+ *   reboot    — reboot (CACT_SYSCTL_REBOOT + CACT_REBOOT_RESTART)
+ *   halt      — halt (CACT_REBOOT_HALT)
+ *   poweroff  — power off (CACT_REBOOT_POWEROFF)
+ *   suspend   — suspend to RAM (CACT_REBOOT_SUSPEND; alias: sleep), replies
+ *               "ok\n" only after resuming
  *
- * Сокет только в ядерном реестре (файл в /run не создаётся). Кнопочные/ACPI
- * события питанием не передаются в юзерспейс — powerd лишь исполняет запросы
- * и ведёт журнал. Запускается супервизором cgoct как /sbin/powerd.
+ * The socket exists only in the kernel registry (no file is created in /run).
+ * Power button/ACPI events are not passed to userspace — powerd only executes
+ * requests and keeps a log. Started by the cgoct supervisor as /sbin/powerd.
  *
- * /etc/powerd.conf (все ключи необязательны; создаётся при первом запуске):
+ * /etc/powerd.conf (all keys optional; created on first start):
  *   file=/var/log/powerd.log
  *   console=0
  */
@@ -40,12 +40,12 @@ static char log_path[128] = LOG_DEFAULT;
 static int  console_on    = 0;
 static int  out_fd        = -1;
 
-/* Конфиг по умолчанию: пишется при первом запуске, если файла ещё нет. */
+/* Default config: written on first start if the file does not exist yet. */
 static const char default_config[] =
     "# powerd config - auto-generated on first start.\n"
     "#\n"
-    "# file    - журнал событий\n"
-    "# console - дублировать на /dev/console (0|1)\n"
+    "# file    - event log\n"
+    "# console - duplicate to /dev/console (0|1)\n"
     "\n"
     "file=/var/log/powerd.log\n"
     "console=0\n";
@@ -105,9 +105,9 @@ static void log_event(const char *msg) {
     }
 }
 
-/* Выполнить команду управления питанием (root only, /dev/sys).
- * Возвращает результат ioctl: для reboot/halt/poweroff управление сюда обычно
- * не возвращается, suspend возвращается после пробуждения. */
+/* Execute a power management command (root only, /dev/sys).
+ * Returns the ioctl result: for reboot/halt/poweroff control usually does not
+ * return here, suspend returns after resume. */
 static int power_cmd(uint32_t cmd, const char *name) {
     char line[128];
     snprintf(line, sizeof(line), "powerd: executing %s\n", name);
@@ -132,7 +132,7 @@ static void handle_client(int cl) {
     int  got = 0;
     int  n;
 
-    /* Читаем строку запроса (до '\n'). */
+    /* Read the request line (up to '\n'). */
     while (got < LINE_MAX - 1) {
         n = (int)recv(cl, buf, 1, 0);
         if (n <= 0) break;
@@ -142,10 +142,10 @@ static void handle_client(int cl) {
     req[got] = '\0';
 
     if (got == 0) {
-        return; /* клиент закрыл соединение */
+        return; /* client closed the connection */
     }
 
-    /* Убрать хвостовые пробелы. */
+    /* Strip trailing whitespace. */
     while (got > 0 && (req[got - 1] == ' ' || req[got - 1] == '\t'))
         req[--got] = '\0';
 
@@ -162,7 +162,7 @@ static void handle_client(int cl) {
         if (power_cmd(CACT_REBOOT_POWEROFF, "poweroff") != 0)
             send(cl, "ERR poweroff rejected\n", 22, 0);
     } else if (strcmp(req, "suspend") == 0 || strcmp(req, "sleep") == 0) {
-        /* Блокируется до пробуждения платформы. */
+        /* Blocks until the platform resumes. */
         if (power_cmd(CACT_REBOOT_SUSPEND, "suspend") == 0) {
             send(cl, "ok\n", 3, 0);
             log_event("powerd: resumed\n");
@@ -218,7 +218,7 @@ int main(int argc, char *argv[]) {
         if (srv < 0) {
             srv = bind_listener();
             if (srv < 0) {
-                /* Не выходим: ждём, когда адрес освободится. */
+                /* Do not exit: wait for the address to be released. */
                 sleep(3);
                 continue;
             }
